@@ -40,6 +40,20 @@ functions:
           path: read
           method: get
 
+  deleteData:
+    handler: handler.delete
+    events:
+      - http:
+          path: delete
+          method: delete
+
+  clearCache:
+    handler: handler.clearCache
+    events:
+      - http:
+          path: clear-cache
+          method: delete
+
 plugins:
   - serverless-localstack
 

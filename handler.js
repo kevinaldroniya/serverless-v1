@@ -27,17 +27,54 @@ exports.hello = async (event) => {
 const BUCKET_NAME = "my-local-bucket";
 const FILE_KEY = "service_data.json";
 
-const saveToRedis = async (obj, prefix = "service_data::") => {
-  for (const [key, value] of Object.entries(obj)) {
-    const redisKey = `${prefix}${key}`;
-    if (typeof value === "object" && !Array.isArray(value)) {
-      await redis.set(redisKey, JSON.stringify(value));
-      await saveToRedis(value, `${redisKey}.`);
-    } else {
-      await redis.set(redisKey, JSON.stringify(value));
-    }
+async function cacheToRedis(data) {
+  try {
+    const pipeline = redis.pipeline();
+    Object.entries(data).forEach(([key, value]) => {
+      pipeline.set(generateKeyName(key), JSON.stringify(value));
+    });
+    await pipeline.exec();
+  } catch (error) {
+    console.error("Redis Cache Error:", error);
   }
-};
+}
+
+async function fetchFromRedis(key) {
+  try {
+    const data = await redis.get(generateKeyName(key));
+    return data ? JSON.parse(data) : null;
+  } catch (error) {
+    console.error("Redis Fetch Error:", error.message);
+    return null; // Fail gracefully and let S3 handle the request
+  }
+}
+
+function getNestedValue(obj, path) {
+  return path.reduce((acc, part) => {
+    if (acc && typeof acc === "object") return acc[part];
+    return undefined;
+  }, obj);
+}
+
+async function s3FileExists(bucket, key) {
+  try {
+    await s3.headObject({ Bucket: bucket, Key: key }).promise();
+    return true;
+  } catch (error) {
+    return error.code === "NotFound" ? false : true;
+  }
+}
+
+async function saveDataToS3(data) {
+  await s3
+    .putObject({
+      Bucket: BUCKET_NAME,
+      Key: FILE_KEY,
+      Body: JSON.stringify(data, null, 2),
+      ContentType: "application/json",
+    })
+    .promise();
+}
 
 // Helper function to generate keys
 const generateKeyName = (serviceName) => {
@@ -46,17 +83,28 @@ const generateKeyName = (serviceName) => {
 
 // Lambda function to add data to S3
 module.exports.add = async (event) => {
-  const newData = JSON.parse(event.body);
+  let newData;
   let existingData = {};
+  try {
+    newData = JSON.parse(event.body);
+  } catch (error) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({
+        error: "Invalid JSON format",
+      }),
+    };
+  }
 
   try {
-    const params = {
-      Bucket: BUCKET_NAME,
-      Key: FILE_KEY,
-    };
-    const s3Response = await s3.getObject(params).promise();
-    existingData = JSON.parse(s3Response.Body.toString());
+    if (await s3FileExists(BUCKET_NAME, FILE_KEY)) {
+      const s3Response = await s3
+        .getObject({ Bucket: BUCKET_NAME, Key: FILE_KEY })
+        .promise();
+      existingData = JSON.parse(s3Response.Body.toString());
+    }
   } catch (error) {
+    console.error("S3 Fetch Error:", error);
     if (error.code !== "NoSuchKey") {
       return {
         statusCode: 500,
@@ -69,30 +117,14 @@ module.exports.add = async (event) => {
   }
 
   // Merge existing data with the new one
-  existingData = { ...existingData, ...newData };
+  existingData = Object.assign({}, existingData, newData);
 
   try {
     // Upload JSON to S3
-    await s3
-      .putObject({
-        Bucket: BUCKET_NAME,
-        Key: FILE_KEY,
-        Body: JSON.stringify(existingData, null, 2),
-        ContentType: "application/json",
-      })
-      .promise();
+    await saveDataToS3(existingData);
 
     // Cache data to redis
-    await saveToRedis(existingData);
-    // for (const [serviceName, serviceData] of Object.entries(existingData)) {
-    //   const redisKey = generateKeyName(serviceName);
-    //   const dataValue =
-    //     typeof serviceData === "object"
-    //       ? JSON.stringify(serviceData)
-    //       : serviceData;
-    //   await redis.set(redisKey, dataValue);
-    // }
-
+    await cacheToRedis(existingData);
     return {
       statusCode: 201,
       body: JSON.stringify({
@@ -111,44 +143,72 @@ module.exports.add = async (event) => {
 };
 
 module.exports.read = async (event) => {
+  try {
+    if (!event.queryStringParameters?.key?.trim()) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: "Missing 'key' parameter" }),
+      };
+    }
+    const { key } = event.queryStringParameters;
+    const partPath = key.split(".");
+    const redisKey = generateKeyName(partPath[0]);
+
+    let result = await fetchFromRedis(redisKey);
+
+    if (!result) {
+      if (!(await s3FileExists(BUCKET_NAME, FILE_KEY))) {
+        return {
+          statusCode: 404,
+          body: JSON.stringify({
+            error: `Key "${key}" not found in data`,
+          }),
+        };
+      }
+      const s3Response = await s3
+        .getObject({ Bucket: BUCKET_NAME, Key: FILE_KEY })
+        .promise();
+      const data = JSON.parse(s3Response.Body.toString());
+      result = data[partPath[0]];
+
+      if (result) await cacheToRedis({ [partPath[0]]: result });
+    }
+
+    const finalResult = getNestedValue(result, partPath.slice(1));
+
+    return finalResult !== undefined
+      ? { statusCode: 200, body: JSON.stringify({ [key]: finalResult }) }
+      : {
+          statusCode: 404,
+          body: JSON.stringify({
+            error: `Key "${key}" not found in data`,
+          }),
+        };
+  } catch (error) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({
+        error: "Failed to retrieve data",
+        details: error.message,
+      }),
+    };
+  }
+};
+
+module.exports.delete = async (event) => {
+  if (!event.queryStringParameters?.key?.trim()) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: "Missing 'key' parameter" }),
+    };
+  }
+
   const { key } = event.queryStringParameters;
-  const partPath = key.split(".");
   const redisKey = generateKeyName(key);
 
   try {
-    // Check redis first
-    const cachedData = await redis.get(redisKey);
-    if (cachedData) {
-      let parsedData;
-      try {
-        parsedData = JSON.parse(cachedData);
-      } catch (e) {
-        parsedData = cachedData; // Use as-is if parsing fails
-      }
-
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ [key]: parsedData }),
-      };
-    }
-
-    // if not found in redis, check on s3
-    const s3Data = await s3
-      .getObject({
-        Bucket: BUCKET_NAME,
-        Key: FILE_KEY,
-      })
-      .promise();
-    const data = JSON.parse(s3Data.Body.toString());
-    const result = partPath.reduce((acc, part) => {
-      if (acc && acc[part] !== undefined) {
-        return acc[part];
-      }else{
-        return undefined;
-      }
-    }, data);
-
-    if (!result) {
+    await redis.del(redisKey);
+    if (!(await s3FileExists(BUCKET_NAME, FILE_KEY))) {
       return {
         statusCode: 404,
         body: JSON.stringify({
@@ -156,28 +216,71 @@ module.exports.read = async (event) => {
         }),
       };
     }
-    
+    const s3Response = await s3
+      .getObject({ Bucket: BUCKET_NAME, Key: FILE_KEY })
+      .promise();
+    let existingData = JSON.parse(s3Response.Body.toString());
 
-    // Cache data in redis
-    await saveToRedis(data);
-    // const dataValue =
-    //   typeof data[partPath[0]] === "object"
-    //     ? JSON.stringify(data[partPath[0]])
-    //     : data[partPath[0]];
-    // console.log("🚀 ~ module.exports.read= ~ dataValue:", dataValue);
+    // Remove key from json data
+    if (!(key in existingData)) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: `Key "${key}" not found in S3 data` }),
+      };
+    }
 
-    // await redis.set(redisKey, dataValue);
+    delete existingData[key];
+
+    const updatedData =
+      Object.keys(existingData).length > 0 ? existingData : {};
+
+    await saveDataToS3(updatedData);
+
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        [key]: result,
-      }),
+      body: JSON.stringify({ message: `Key "${key}" deleted successfully` }),
     };
   } catch (error) {
+    console.error("Delete Error:", error);
     return {
       statusCode: 500,
       body: JSON.stringify({
-        error: "Failed to retrieve data",
+        error: "Failed to delete key",
+        details: error.message,
+      }),
+    };
+  }
+};
+
+module.exports.clearCache = async () => {
+  try {
+    let cursor = 0;
+    do {
+      const scanResult = await redis.scan(
+        cursor,
+        "MATCH",
+        "service_data::*",
+        "COUNT",
+        100
+      );
+      cursor = scanResult[0];
+      const keysToDelete = scanResult[1];
+      if (keysToDelete.length > 0) {
+        await redis.del(...keysToDelete);
+      }
+    } while (cursor !== "0");
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        message: "All service_data cache cleared successfully",
+      }),
+    };
+  } catch (error) {
+    console.error("Redis Clear Cache Error:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({
+        error: "Failed to clear Redis cache",
         details: error.message,
       }),
     };
