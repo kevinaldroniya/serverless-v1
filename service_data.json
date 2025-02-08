@@ -1,0 +1,21 @@
+{
+  "plutus": {
+    "doku": {
+      "va": {
+        "bca": "Please try again later",
+        "bni": "Please try again later"
+      }
+    },
+    "espay": {
+      "va": {
+        "bca": "Please try again later",
+        "bni": "Please try again later"
+      }
+    }
+  },
+  "karobar": {
+    "adler": {
+      "daylimotion": "please try again later"
+    }
+  }
+}

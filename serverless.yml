@@ -1,0 +1,59 @@
+# "org" ensures this Service is used with the correct Serverless Framework Access Key.
+org: ald1927
+# "service" is the name of this project. This will also be added to your AWS resource names.
+service: sls-v1
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  environment:
+    BUCKET_NAME: my-local-bucket
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+  # iamRoleStatements:
+  #   - Effect: Allow
+  #     Action:
+  #       - s3:PutObject
+  #       - s3:GetObject
+  #     Resource: "arn:aws:s3:::${self:provider.environment.BUCKET_NAME}/*"
+
+
+functions:
+  hello:
+    handler: handler.hello
+    events:
+      - http:
+          path: /
+          method: get
+  
+  addNewData:
+    handler: handler.add
+    events:
+      - http:
+          path: add
+          method: post
+
+  readData:
+    handler: handler.read
+    events:
+      - http:
+          path: read
+          method: get
+
+plugins:
+  - serverless-localstack
+
+
+custom:
+  localstack:
+    stages:
+      - dev
+    endpointFile: localstack_endpoints.json
+
+resources:
+  Resources:
+    MyLocalBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.BUCKET_NAME}
+
